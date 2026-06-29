@@ -1,0 +1,932 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ========== Helpers ========== */
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasAuthEmail() {
+      return signedIn() && request.auth.token.email != null;
+    }
+
+    function hasExisting(field) {
+      return field in resource.data;
+    }
+
+    function hasIncoming(field) {
+      return field in request.resource.data;
+    }
+
+    function requires(keys) {
+      return request.resource.data.keys().hasAll(keys);
+    }
+
+    function onlyIncoming(keys) {
+      return request.resource.data.keys().hasOnly(keys);
+    }
+
+    function onlyChanged(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    function isValidBloodMarker(marker) {
+      return marker is map
+             && marker.markerId is string
+             && marker.name is string
+             && marker.category is string
+             && marker.value is number
+             && marker.unit is string
+             && (!('referenceMin' in marker) || marker.referenceMin == null || marker.referenceMin is number)
+             && (!('referenceMax' in marker) || marker.referenceMax == null || marker.referenceMax is number)
+             && (!('optimalMin' in marker) || marker.optimalMin == null || marker.optimalMin is number)
+             && (!('optimalMax' in marker) || marker.optimalMax == null || marker.optimalMax is number)
+             && marker.flag in ['low', 'normal', 'high', 'unknown']
+             && marker.trend in ['up', 'down', 'stable', 'new'];
+    }
+
+    function isValidBloodMarkers(markers) {
+      return markers is list
+             && markers.size() <= 250
+             && (markers.size() == 0 || isValidBloodMarker(markers[0]))
+             && (markers.size() <= 1 || isValidBloodMarker(markers[1]))
+             && (markers.size() <= 2 || isValidBloodMarker(markers[2]))
+             && (markers.size() <= 3 || isValidBloodMarker(markers[3]))
+             && (markers.size() <= 4 || isValidBloodMarker(markers[4]))
+             && (markers.size() <= 5 || isValidBloodMarker(markers[5]))
+             && (markers.size() <= 6 || isValidBloodMarker(markers[6]))
+             && (markers.size() <= 7 || isValidBloodMarker(markers[7]))
+             && (markers.size() <= 8 || isValidBloodMarker(markers[8]))
+             && (markers.size() <= 9 || isValidBloodMarker(markers[9]));
+    }
+
+    function isValidBloodTestFor(uid) {
+      return requires([
+               'id',
+               'userId',
+               'testName',
+               'labName',
+               'testDate',
+               'createdAt',
+               'updatedAt',
+               'fastingStatus',
+               'notes',
+               'source',
+               'status',
+               'markers'
+             ])
+             && request.resource.data.userId == uid
+             && request.resource.data.testDate is timestamp
+             && request.resource.data.markers is list
+             && request.resource.data.fastingStatus in ['fasted', 'not_fasted', 'unknown']
+             && request.resource.data.source in ['manual', 'pdf_upload', 'image_upload']
+             && request.resource.data.status in ['normal', 'attention', 'critical_unknown']
+             && isValidBloodMarkers(request.resource.data.markers);
+    }
+
+    function isValidLevelModelPoint(point) {
+      return point is map
+             && point.time is timestamp
+             && point.estimatedActiveAmount is number
+             && point.relativeLevelPercent is number
+             && point.relativeLevelPercent >= 0
+             && point.relativeLevelPercent <= 100;
+    }
+
+    function isValidLevelModelPoints(points) {
+      return points is list
+             && points.size() <= 1000
+             && (points.size() == 0 || isValidLevelModelPoint(points[0]))
+             && (points.size() <= 1 || isValidLevelModelPoint(points[1]))
+             && (points.size() <= 2 || isValidLevelModelPoint(points[2]))
+             && (points.size() <= 3 || isValidLevelModelPoint(points[3]))
+             && (points.size() <= 4 || isValidLevelModelPoint(points[4]))
+             && (points.size() <= 5 || isValidLevelModelPoint(points[5]))
+             && (points.size() <= 6 || isValidLevelModelPoint(points[6]))
+             && (points.size() <= 7 || isValidLevelModelPoint(points[7]))
+             && (points.size() <= 8 || isValidLevelModelPoint(points[8]))
+             && (points.size() <= 9 || isValidLevelModelPoint(points[9]));
+    }
+
+    function isValidLevelModelFor(uid) {
+      return requires([
+               'id',
+               'userId',
+               'compoundName',
+               'protocolId',
+               'generatedAt',
+               'halfLifeHours',
+               'doseUnit',
+               'points'
+             ])
+             && request.resource.data.userId == uid
+             && request.resource.data.compoundName is string
+             && request.resource.data.protocolId is string
+             && request.resource.data.generatedAt is timestamp
+             && request.resource.data.halfLifeHours is number
+             && request.resource.data.halfLifeHours > 0
+             && request.resource.data.doseUnit is string
+             && isValidLevelModelPoints(request.resource.data.points);
+    }
+
+    /* ========== Identity ========== */
+
+    function hasUsableExistingOwnerUid() {
+      return hasExisting('ownerUid')
+             && resource.data.ownerUid is string
+             && resource.data.ownerUid != '';
+    }
+
+    function isOwnerExisting() {
+      return signedIn()
+             && hasUsableExistingOwnerUid()
+             && resource.data.ownerUid == request.auth.uid;
+    }
+
+    function isOwnerIncoming() {
+      return signedIn()
+             && hasIncoming('ownerUid')
+             && request.resource.data.ownerUid == request.auth.uid;
+    }
+
+    function ownerImmutable() {
+      return hasExisting('ownerUid') == hasIncoming('ownerUid')
+             && (
+               !hasExisting('ownerUid')
+               || request.resource.data.ownerUid == resource.data.ownerUid
+             );
+    }
+
+    function ownerImmutableOrLegacyBackfill() {
+      return ownerImmutable()
+             || (
+               signedIn()
+               && !hasUsableExistingOwnerUid()
+               && hasIncoming('ownerUid')
+               && request.resource.data.ownerUid == request.auth.uid
+             );
+    }
+
+    function emailMatchesExisting() {
+      return hasAuthEmail()
+             && hasExisting('email')
+             && resource.data.email == request.auth.token.email;
+    }
+
+    function emailMatchesIncoming() {
+      return hasAuthEmail()
+             && hasIncoming('email')
+             && request.resource.data.email == request.auth.token.email;
+    }
+
+    function emailImmutable() {
+      return hasExisting('email') == hasIncoming('email')
+             && (
+               !hasExisting('email')
+               || request.resource.data.email == resource.data.email
+             );
+    }
+
+    function participantsImmutable() {
+      return hasExisting('participantUids') == hasIncoming('participantUids')
+             && (
+               !hasExisting('participantUids')
+               || request.resource.data.participantUids == resource.data.participantUids
+             );
+    }
+
+    /* ========== Subscription Safety ========== */
+
+    function planImmutable() {
+      return hasExisting('plan') == hasIncoming('plan')
+             && (
+               !hasExisting('plan')
+               || request.resource.data.plan == resource.data.plan
+             )
+             && hasExisting('subscription') == hasIncoming('subscription')
+             && (
+               !hasExisting('subscription')
+               || request.resource.data.subscription == resource.data.subscription
+             )
+             && hasExisting('tier') == hasIncoming('tier')
+             && (
+               !hasExisting('tier')
+               || request.resource.data.tier == resource.data.tier
+             );
+    }
+
+    function referralsCountImmutable() {
+      return hasExisting('referralsCount') == hasIncoming('referralsCount')
+             && (
+               !hasExisting('referralsCount')
+               || request.resource.data.referralsCount == resource.data.referralsCount
+             );
+    }
+
+    function isLegacyEmailOwnerExisting() {
+      return signedIn()
+             && !hasUsableExistingOwnerUid()
+             && emailMatchesExisting();
+    }
+
+    function validFreeUserCreate(uid) {
+      return signedIn()
+             && request.auth.uid == uid
+             && requires(['uid', 'ownerUid', 'email'])
+             && onlyIncoming([
+               'uid',
+               'ownerUid',
+               'email',
+               'email_lower',
+               'subscription',
+               'plan',
+               'tier',
+               'monthlyChatsLeft',
+               'scansLeft',
+               'referralsCount',
+               'createdAt',
+               'updatedAt',
+               'lastReset',
+               'Scanned',
+               'Scaned',
+               'gender',
+               'displayName',
+               'photoURL',
+               'bestVersionPreview',
+               'bestVersionPreviewUpdatedAt'
+             ])
+             && request.resource.data.uid == request.auth.uid
+             && request.resource.data.ownerUid == request.auth.uid
+             && emailMatchesIncoming()
+             && (!hasIncoming('subscription') || request.resource.data.subscription == 'Free')
+             && (!hasIncoming('plan') || request.resource.data.plan == 'free')
+             && (!hasIncoming('tier') || request.resource.data.tier == 'free')
+             && (!hasIncoming('scansLeft') || request.resource.data.scansLeft == 0)
+             && (!hasIncoming('referralsCount') || request.resource.data.referralsCount == 0);
+    }
+
+    function preauthImageUploadFields() {
+      return [
+        'deviceID',
+        'imageURL',
+        'storagePath',
+        'folder',
+        'kind',
+        'authType',
+        'source',
+        'status',
+        'uploadedAt',
+        'updatedAt',
+        'originalImageURL',
+        'generatedImageURL',
+        'scanID',
+        'sessionID',
+        'generatedAt',
+        'claimedByUid',
+        'migratedAt'
+      ];
+    }
+
+    function validPreauthImageUploadCreate(deviceId) {
+      return !signedIn()
+             && requires([
+               'deviceID',
+               'imageURL',
+               'storagePath',
+               'folder',
+               'kind',
+               'authType',
+               'source',
+               'status',
+               'uploadedAt',
+               'updatedAt'
+             ])
+             && onlyIncoming(preauthImageUploadFields())
+             && request.resource.data.deviceID == deviceId
+             && request.resource.data.imageURL is string
+             && request.resource.data.storagePath == 'preauth/' + deviceId + '/best-version/face.jpg'
+             && request.resource.data.folder == 'best-version'
+             && request.resource.data.kind == 'face'
+             && request.resource.data.authType == 'preauth'
+             && request.resource.data.source == 'entry_onboarding_best_version'
+             && request.resource.data.status == 'uploaded'
+             && request.resource.data.uploadedAt == request.time
+             && request.resource.data.updatedAt == request.time;
+    }
+
+    function preauthImageUploadIdentityImmutable() {
+      return request.resource.data.deviceID == resource.data.deviceID
+             && request.resource.data.imageURL == resource.data.imageURL
+             && request.resource.data.storagePath == resource.data.storagePath
+             && request.resource.data.folder == resource.data.folder
+             && request.resource.data.kind == resource.data.kind
+             && request.resource.data.authType == resource.data.authType
+             && request.resource.data.source == resource.data.source
+             && request.resource.data.uploadedAt == resource.data.uploadedAt;
+    }
+
+    function validPreauthImageGeneratedUpdate() {
+      return !signedIn()
+             && preauthImageUploadIdentityImmutable()
+             && onlyChanged([
+               'status',
+               'originalImageURL',
+               'generatedImageURL',
+               'scanID',
+               'sessionID',
+               'generatedAt',
+               'updatedAt'
+             ])
+             && request.resource.data.status == 'generated'
+             && request.resource.data.originalImageURL is string
+             && request.resource.data.generatedImageURL is string
+             && request.resource.data.scanID is string
+             && request.resource.data.sessionID is string
+             && request.resource.data.generatedAt == request.time
+             && request.resource.data.updatedAt == request.time;
+    }
+
+    function validPreauthImageMigratedUpdate() {
+      return signedIn()
+             && preauthImageUploadIdentityImmutable()
+             && onlyChanged([
+               'status',
+               'claimedByUid',
+               'migratedAt',
+               'updatedAt'
+             ])
+             && request.resource.data.status == 'migrated'
+             && request.resource.data.claimedByUid == request.auth.uid
+             && request.resource.data.migratedAt == request.time
+             && request.resource.data.updatedAt == request.time;
+    }
+
+    /* ========== Referral Guard ========== */
+
+    function isReferralIncrementFor(uid) {
+      return signedIn()
+             && request.auth.uid != uid
+             && exists(/databases/$(database)/documents/Referrals/$(request.auth.uid))
+             && get(/databases/$(database)/documents/Referrals/$(request.auth.uid)).data.status == 'credited'
+             && get(/databases/$(database)/documents/Referrals/$(request.auth.uid)).data.referrerId == uid
+             && hasExisting('referralsCount')
+             && hasIncoming('referralsCount')
+             && request.resource.data.referralsCount == resource.data.referralsCount + 1
+             && onlyChanged(['referralsCount']);
+    }
+
+    function isReferralDirectoryOwner() {
+      return isOwnerExisting();
+    }
+
+    function routineDocumentOwnerExisting(routineId) {
+      return signedIn()
+             && (
+               routineId == request.auth.uid
+               || (
+                 hasExisting('ownerUid')
+                 && resource.data.ownerUid == request.auth.uid
+               )
+               || (
+                 hasExisting('uid')
+                 && resource.data.uid == request.auth.uid
+               )
+               || (
+                 hasExisting('uuid')
+                 && resource.data.uuid == request.auth.uid
+               )
+               || (
+                 hasExisting('userId')
+                 && resource.data.userId == request.auth.uid
+               )
+             );
+    }
+
+    function routineDocumentOwnerIncoming(routineId) {
+      return signedIn()
+             && routineId == request.auth.uid
+             && (!hasIncoming('ownerUid') || request.resource.data.ownerUid == request.auth.uid)
+             && (!hasIncoming('uid') || request.resource.data.uid == request.auth.uid)
+             && (!hasIncoming('uuid') || request.resource.data.uuid == request.auth.uid)
+             && (!hasIncoming('userId') || request.resource.data.userId == request.auth.uid);
+    }
+
+    function routineDocumentFields() {
+      return [
+        'id',
+        'uid',
+        'uuid',
+        'userId',
+        'ownerUid',
+        'routineId',
+        'routineType',
+        'isActive',
+        'glowupJson',
+        'glowupFeatureScoresJson',
+        'glowupRoutineSource',
+        'glowupRoutineFingerprint',
+        'glowupRoutineSummary',
+        'glowupRoutineUpdatedAt',
+        'glowupRoutineScanId',
+        'skincareRoutine',
+        'skincareRoutineUpdatedAt',
+        'createdAt',
+        'updatedAt'
+      ];
+    }
+
+    function routineChildOwnerIncoming(routineId) {
+      return signedIn()
+             && routineId == request.auth.uid
+             && (!hasIncoming('ownerUid') || request.resource.data.ownerUid == request.auth.uid)
+             && (!hasIncoming('uid') || request.resource.data.uid == request.auth.uid)
+             && (!hasIncoming('uuid') || request.resource.data.uuid == request.auth.uid)
+             && (!hasIncoming('userId') || request.resource.data.userId == request.auth.uid);
+    }
+
+    function routineChildFields() {
+      return [
+        'id',
+        'scanId',
+        'userId',
+        'uid',
+        'uuid',
+        'ownerUid',
+        'title',
+        'description',
+        'category',
+        'frequency',
+        'priority',
+        'linkedFeature',
+        'triggerValue',
+        'estimatedMinutes',
+        'xpReward',
+        'isActive',
+        'isGeneratedFromScan',
+        'completedDates',
+        'currentStreak',
+        'longestStreak',
+        'lastCompletedDate',
+        'createdAt',
+        'updatedAt'
+      ];
+    }
+
+    /* ========== Referral Directory ========== */
+
+    match /ReferralDirectory/{code} {
+      allow read: if true;
+
+      allow create: if signedIn()
+                    && requires(['ownerUid'])
+                    && onlyIncoming([
+                      'ownerUid',
+                      'code',
+                      'email_lower',
+                      'displayName',
+                      'createdAt',
+                      'updatedAt'
+                    ])
+                    && request.resource.data.ownerUid == request.auth.uid
+                    && (!hasIncoming('code') || request.resource.data.code == code);
+
+      allow update: if isReferralDirectoryOwner()
+                    && ownerImmutable()
+                    && onlyChanged([
+                      'email_lower',
+                      'displayName',
+                      'updatedAt'
+                    ])
+                    && (
+                      !hasExisting('code')
+                      || (
+                        hasIncoming('code')
+                        && request.resource.data.code == resource.data.code
+                      )
+                    );
+
+      allow delete: if false;
+    }
+
+    /* ========== Users ========== */
+
+    match /peptides/{peptideId} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    match /bloodMarkerDefinitions/{markerId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /PreauthImageUploads/{deviceId} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if validPreauthImageUploadCreate(deviceId);
+      allow update: if validPreauthImageGeneratedUpdate()
+                    || validPreauthImageMigratedUpdate();
+      allow delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /protocols/{protocolId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /logs/{logId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /inventory/{itemId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /reminders/{reminderId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /settings/{settingId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /bloodTests/{bloodTestId} {
+        allow read, delete: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+                              && request.auth.uid == uid
+                              && isValidBloodTestFor(uid);
+      }
+
+      match /levelModels/{modelId} {
+        allow read, delete: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+                              && request.auth.uid == uid
+                              && isValidLevelModelFor(uid);
+      }
+    }
+
+    match /Users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      allow create: if validFreeUserCreate(uid);
+
+      allow update: if signedIn()
+                    && request.auth.uid == uid
+                    && planImmutable()
+                    && ownerImmutable()
+                    && emailImmutable()
+                    && referralsCountImmutable();
+
+      allow update: if isReferralIncrementFor(uid);
+
+      allow delete: if false;
+
+      match /profile/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /settings/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /private/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /daily/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /hydration/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /hydrationLogs/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /badges/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /FacialTraining/{doc} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /routineTasks/{doc} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+                              && request.auth.uid == uid
+                              && onlyIncoming(routineChildFields())
+                              && routineChildOwnerIncoming(uid);
+        allow delete: if false;
+      }
+
+      match /routineRecommendations/{doc} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+                              && request.auth.uid == uid
+                              && onlyIncoming(routineChildFields())
+                              && routineChildOwnerIncoming(uid);
+        allow delete: if false;
+      }
+    }
+
+    /* ========== Routines ========== */
+
+    match /Routines/{uid} {
+      allow read: if routineDocumentOwnerExisting(uid);
+
+      allow create: if routineDocumentOwnerIncoming(uid)
+                    && onlyIncoming(routineDocumentFields());
+
+      allow update: if routineDocumentOwnerExisting(uid)
+                    && routineDocumentOwnerIncoming(uid)
+                    && onlyChanged(routineDocumentFields());
+
+      allow delete: if false;
+
+      match /routineTasks/{doc} {
+        allow read: if signedIn() && request.auth.uid == uid;
+
+        allow create: if routineChildOwnerIncoming(uid)
+                      && onlyIncoming(routineChildFields());
+
+        allow update: if signedIn()
+                      && request.auth.uid == uid
+                      && routineChildOwnerIncoming(uid)
+                      && onlyChanged(routineChildFields());
+
+        allow delete: if false;
+      }
+
+      match /routineRecommendations/{doc} {
+        allow read: if signedIn() && request.auth.uid == uid;
+
+        allow create: if routineChildOwnerIncoming(uid)
+                      && onlyIncoming(routineChildFields());
+
+        allow update: if signedIn()
+                      && request.auth.uid == uid
+                      && routineChildOwnerIncoming(uid)
+                      && onlyChanged(routineChildFields());
+
+        allow delete: if false;
+      }
+    }
+
+    /* ========== Scans ========== */
+
+    match /Scans/{id} {
+      allow read: if isOwnerExisting()
+                  || isLegacyEmailOwnerExisting();
+
+      // Scan jobs and results are backend-authored only. The backend writes
+      // uid, ownerUid, scan_id, status, and result fields via Admin SDK after
+      // verifying Firebase Auth, rate limits, ownership, and image validation.
+      allow create, update, delete: if false;
+    }
+
+    /* ========== Ratings ========== */
+
+    match /Ratings/{id} {
+      allow read: if isOwnerExisting();
+
+      allow create: if isOwnerIncoming();
+
+      allow update: if isOwnerExisting()
+                    && ownerImmutable();
+
+      allow delete: if isOwnerExisting();
+    }
+
+    /* ========== Referrals ========== */
+
+    match /Referrals/{id} {
+      allow get: if signedIn() && request.auth.uid == id;
+
+      allow read: if (
+                    hasExisting('public')
+                    && resource.data.public == true
+                  )
+                  || (
+                    signedIn()
+                    && hasExisting('referredId')
+                    && resource.data.referredId == request.auth.uid
+                  )
+                  || (
+                    signedIn()
+                    && hasExisting('referrerId')
+                    && resource.data.referrerId == request.auth.uid
+                  );
+
+      allow create: if signedIn()
+                    && id == request.auth.uid
+                    && requires(['referredId'])
+                    && onlyIncoming([
+                      'referredId',
+                      'status',
+                      'public',
+                      'createdAt',
+                      'updatedAt'
+                    ])
+                    && request.resource.data.referredId == request.auth.uid
+                    && (!hasIncoming('status') || request.resource.data.status == 'self')
+                    && (!hasIncoming('public') || request.resource.data.public == false);
+
+      allow update: if signedIn()
+                    && id == request.auth.uid
+                    && hasExisting('status')
+                    && resource.data.status == 'self'
+                    && (!hasExisting('referrerId') || resource.data.referrerId == null)
+                    && hasExisting('referredId')
+                    && resource.data.referredId == request.auth.uid
+                    && hasIncoming('referredId')
+                    && request.resource.data.referredId == resource.data.referredId
+                    && hasIncoming('status')
+                    && request.resource.data.status == 'credited'
+                    && hasIncoming('referrerId')
+                    && request.resource.data.referrerId is string
+                    && request.resource.data.referrerId != request.auth.uid
+                    && onlyChanged([
+                      'status',
+                      'referrerId',
+                      'creditedAt',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    /* ========== AIscend Challenge ========== */
+
+    function challengeParticipantFields() {
+      return [
+        'uid',
+        'email',
+        'displayName',
+        'photoURL',
+        'isPremium',
+        'totalPoints',
+        'xpPoints',
+        'referralPoints',
+        'streakPoints',
+        'routinePoints',
+        'scanPoints',
+        'currentStreak',
+        'longestStreak',
+        'referralCount',
+        'premiumReferralCount',
+        'routinesCompleted',
+        'scansCompleted',
+        'progressPhotosUploaded',
+        'rank',
+        'joinedAt',
+        'updatedAt',
+        'eligibleForReward',
+        'verificationStatus'
+      ];
+    }
+
+    function challengeEventTypes() {
+      return [
+        'routine_completed',
+        'full_day_completed',
+        'streak_3',
+        'streak_7',
+        'streak_14',
+        'streak_30',
+        'referral_signup',
+        'referral_premium',
+        'weekly_scan_completed',
+        'progress_photo_uploaded',
+        'streak_freeze_used'
+      ];
+    }
+
+    function isOwnChallengeParticipant(uid) {
+      return signedIn()
+             && request.auth.uid == uid
+             && hasIncoming('uid')
+             && request.resource.data.uid == request.auth.uid
+             && request.resource.data.keys().hasOnly(challengeParticipantFields())
+             && (!hasIncoming('eligibleForReward') || request.resource.data.eligibleForReward == false)
+             && (!hasIncoming('verificationStatus') || request.resource.data.verificationStatus in ['pending', 'client_pending']);
+    }
+
+    match /challenges/{challengeId} {
+      allow read: if signedIn();
+      allow write: if false;
+
+      match /participants/{uid} {
+        allow read: if signedIn();
+        allow create, update: if isOwnChallengeParticipant(uid);
+        allow delete: if false;
+      }
+    }
+
+    match /challengeEvents/{eventId} {
+      allow read: if signedIn()
+                  && hasExisting('uid')
+                  && resource.data.uid == request.auth.uid;
+
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly([
+                      'uid',
+                      'eventType',
+                      'points',
+                      'challengeId',
+                      'metadata',
+                      'createdAt'
+                    ])
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.challengeId == 'current_month'
+                    && request.resource.data.eventType in challengeEventTypes()
+                    && request.resource.data.points is int
+                    && request.resource.data.points >= 0
+                    && request.resource.data.metadata is map
+                    && eventId.matches('^' + request.auth.uid + '_current_month_[A-Za-z0-9_]+_.+');
+
+      allow update, delete: if false;
+    }
+
+    /* ========== Chatbot Chats ========== */
+
+    match /CHATBOT_CHATS/{chatId} {
+      allow read: if isOwnerExisting()
+                  || (
+                    signedIn()
+                    && hasExisting('participantUids')
+                    && request.auth.uid in resource.data.participantUids
+                  )
+                  || isLegacyEmailOwnerExisting();
+
+      allow create: if signedIn()
+                    && (
+                      isOwnerIncoming()
+                      || (
+                        hasIncoming('participantUids')
+                        && request.auth.uid in request.resource.data.participantUids
+                      )
+                    );
+
+      allow update: if (
+                      isOwnerExisting()
+                      || (
+                        signedIn()
+                        && hasExisting('participantUids')
+                        && request.auth.uid in resource.data.participantUids
+                      )
+                      || isLegacyEmailOwnerExisting()
+                    )
+                    && ownerImmutableOrLegacyBackfill()
+                    && emailImmutable()
+                    && participantsImmutable();
+
+      allow delete: if isOwnerExisting()
+                    || (
+                      signedIn()
+                      && hasExisting('participantUids')
+                      && request.auth.uid in resource.data.participantUids
+                    )
+                    || isLegacyEmailOwnerExisting();
+    }
+
+    /* ========== Digi Cam Site ========== */
+
+    match /collections/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /days/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /people/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /media/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /shares/{docId} {
+      allow read, write: if false;
+    }
+
+    /* ========== Default Deny ========== */
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

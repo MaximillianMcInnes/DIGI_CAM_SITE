@@ -1,0 +1,71 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isAuthed() { return request.auth != null; }
+    function isOwner(uid) { return isAuthed() && request.auth.uid == uid; }
+
+    // Default: deny unless matched below
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Digi cam gallery media. Server uploads/deletes with Admin SDK; clients can only view.
+    match /media/{collectionSlug}/{mediaId}/{filename} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // User uploads: users/{uid}/uploads/{filename}
+    match /users/{uid}/uploads/{filename} {
+      // Create new upload
+      allow create: if isOwner(uid)
+                    // Only JPG/PNG/WebP up to 8MB
+                    && request.resource.contentType in ['image/jpeg', 'image/png', 'image/webp']
+                    && request.resource.size <= 8 * 1024 * 1024
+                    // Filenames must start with front_ or side_ and have allowed extensions
+                    && request.resource.name.matches('^.*/(front|side)_[A-Za-z0-9._-]+\\.(jpg|jpeg|png|webp)$')
+                    // Require metadata to assert ownership and kind
+                    && request.resource.metadata.uid == uid
+                    && (request.resource.metadata.kind == 'front' || request.resource.metadata.kind == 'side');
+
+      // Prevent modifying existing files (immutability)
+      allow update: if false;
+
+      // Owner can delete their own files
+      allow delete: if isOwner(uid);
+
+      // Backend downloads private objects with Admin/GCS credentials.
+      allow read: if false;
+    }
+
+    // Backend-owned staged scan images. Clients never read or write these.
+    match /users/{uid}/scans/{scanId}/{filename} {
+      allow read, write: if false;
+    }
+
+    // Optional: avatar path
+    match /users/{uid}/avatars/{filename} {
+      allow create: if isOwner(uid)
+                    && request.resource.contentType in ['image/jpeg','image/png']
+                    && request.resource.size <= 5 * 1024 * 1024
+                    && request.resource.metadata.uid == uid;
+      allow update: if false;
+      allow delete: if isOwner(uid);
+      allow read:   if isOwner(uid);
+    }
+
+    // Pre-login Best Version onboarding uploads. These are temporary source
+    // images that the backend downloads with a tokenized URL after /preauth/start.
+    match /preauth/{deviceId}/best-version/face.jpg {
+      allow create: if request.resource.contentType == 'image/jpeg'
+                    && request.resource.size <= 5 * 1024 * 1024
+                    && request.resource.name.matches('^.*/face\\.jpg$')
+                    && request.resource.metadata.device_id == deviceId
+                    && request.resource.metadata.kind == 'face'
+                    && request.resource.metadata.authType == 'preauth';
+      allow update: if false;
+      allow delete: if false;
+      allow read: if true;
+    }
+  }
+}
